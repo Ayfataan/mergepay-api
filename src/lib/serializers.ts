@@ -5,15 +5,21 @@
  * means Authorization tokens, SEP-10 JWTs, session cookies, and other
  * credentials leak into structured log output. These serializers:
  *
- *  1. Redact known-sensitive headers (`authorization`, `cookie`, `set-cookie`)
- *     with a `[REDACTED]` sentinel so the field presence is still visible
- *     but the value is not.
+ *  1. Redact credential-carrying headers — the whole authorization family
+ *     (`authorization`, `proxy-authorization`), `cookie`, `set-cookie`, and
+ *     `x-api-key` — with a `[REDACTED]` sentinel so the field presence is
+ *     still visible but the value is not.
  *  2. Preserve request IDs (`x-request-id`, `x-correlation-id`) and standard
  *     telemetry headers (`user-agent`, `accept`, `content-type`) so debugging
  *     and observability are not degraded.
  *  3. Keep the same top-level shape as Pino's built-in serializers (`method`,
  *     `url`, `headers`, `query` for req; `statusCode`, `headers` for res)
  *     so existing log consumers do not break.
+ *  4. Scrub credential-shaped keys out of `query`/`params` (and out of the
+ *     query string inside `url`, where the same token is logged a second
+ *     time), and run every copied value through the cycle guard below — a
+ *     request or response carrying a self-referencing object must degrade to
+ *     `[CIRCULAR]`, never throw inside Pino's write path.
  *
  * The error serializer follows the same principle for the `err` field: it
  * flattens an error to the fields that actually help an on-call engineer
@@ -41,11 +47,17 @@ const MAX_DETAIL_DEPTH = 4;
 /**
  * Header names that carry authentication credentials or session tokens
  * and must never appear in log output.
+ *
+ * The whole authorization family is listed, not just `authorization`: a proxy
+ * or SDK in front of the API can add `proxy-authorization`, and an API-key
+ * gateway can add `x-api-key`, and both carry the same class of secret.
  */
 const SENSITIVE_HEADERS = new Set([
   "authorization",
+  "proxy-authorization",
   "cookie",
   "set-cookie",
+  "x-api-key",
 ]);
 
 /**
@@ -78,6 +90,19 @@ const SENSITIVE_KEYS = new Set([
   "transactionxdr",
 ]);
 
+/**
+ * Is `key` one of the credential-shaped names this module censors?
+ *
+ * Compared case-insensitively and, failing that, after stripping `_` and `-`,
+ * so `access_token`, `accessToken` and `Access-Token` all match the same rule:
+ * query strings and headers spell credentials every which way, and a rule that
+ * only knows one spelling redacts the wrong half of them.
+ */
+function isSensitiveKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return SENSITIVE_KEYS.has(lower) || SENSITIVE_KEYS.has(lower.replace(/[-_]/g, ""));
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 /**
@@ -94,10 +119,49 @@ function redactHeaders(
     if (SENSITIVE_HEADERS.has(key.toLowerCase())) {
       sanitized[key] = REDACTED;
     } else {
-      sanitized[key] = value;
+      // Real header values are strings or string arrays and pass through
+      // untouched. Anything else — a hand-built object, a self-referencing
+      // value — goes through the same cycle- and depth-guarded sanitizer the
+      // error serializer uses, so it cannot hand `JSON.stringify` a circular
+      // structure. The cast is at this boundary because Node's header type
+      // does not admit the exotic values a log line must still survive.
+      sanitized[key] = sanitizeForLog(value) as string | string[] | undefined;
     }
   }
   return sanitized;
+}
+
+/**
+ * Redact credential-shaped query-string parameters from a request URL.
+ *
+ * The URL is logged verbatim by Fastify's own "incoming request" line, so
+ * scrubbing `req.query` alone would leave `?token=…` in the output one field
+ * over. Parameter names are compared after URL-decoding, lower-casing and
+ * stripping `_`/`-`, so `access_token`, `refresh_token` and `x-api-key` all
+ * match the same rule the detail-payload sanitizer uses.
+ */
+function redactUrlCredentials(url: string): string {
+  const queryAt = url.indexOf("?");
+  if (queryAt === -1 || queryAt === url.length - 1) return url;
+
+  const redactedQuery = url
+    .slice(queryAt + 1)
+    .split("&")
+    .map((pair) => {
+      const equalsAt = pair.indexOf("=");
+      if (equalsAt === -1) return pair;
+      const rawName = pair.slice(0, equalsAt);
+      let name = rawName;
+      try {
+        name = decodeURIComponent(rawName);
+      } catch {
+        // Malformed percent-encoding: fall back to comparing the raw name.
+      }
+      return isSensitiveKey(name) ? `${rawName}=${REDACTED}` : pair;
+    })
+    .join("&");
+
+  return `${url.slice(0, queryAt)}?${redactedQuery}`;
 }
 
 // ─── request serializer ─────────────────────────────────────────────────────
@@ -122,26 +186,39 @@ export interface SerializedRequest {
 /**
  * Pino-compatible serializer for Fastify / Node.js incoming requests.
  *
- * Sensitive headers are replaced with `[REDACTED]`. All other fields are
- * copied verbatim. The serializer is idempotent — passing an already-
- * serialized object is safe.
+ * Sensitive headers are replaced with `[REDACTED]`; credential-shaped query
+ * parameters are redacted in both `query` and `url`; and every copied value
+ * is passed through the cycle guard, so the result is always JSON-safe. The
+ * serializer is idempotent — passing an already-serialized object is safe.
  */
 export function reqSerializer(req: any): SerializedRequest {
   if (!req || typeof req !== "object") {
     return { method: "UNKNOWN", url: "UNKNOWN", headers: {} };
   }
 
+  // Scalar fields are read as strings only: a call site that logs a
+  // malformed object as `{ req }` must not be able to inject a value that
+  // throws when Pino stringifies the line.
   const serialized: SerializedRequest = {
-    method: req.method ?? "UNKNOWN",
-    url: req.url ?? "UNKNOWN",
+    method: typeof req.method === "string" && req.method ? req.method : "UNKNOWN",
+    url: redactUrlCredentials(typeof req.url === "string" ? req.url : "UNKNOWN"),
     headers: redactHeaders(req.headers),
   };
 
+  // `query` and `params` are copied through the shared sanitizer rather than
+  // verbatim: they are attacker-shaped (a query string can carry a `token`)
+  // and, being arbitrary objects, can be circular.
   if (req.query && typeof req.query === "object") {
-    serialized.query = req.query;
+    const query = sanitizeForLog(req.query);
+    if (query && typeof query === "object") {
+      serialized.query = query as Record<string, unknown>;
+    }
   }
   if (req.params && typeof req.params === "object") {
-    serialized.params = req.params;
+    const params = sanitizeForLog(req.params);
+    if (params && typeof params === "object") {
+      serialized.params = params as Record<string, unknown>;
+    }
   }
   // Pino maps an incoming request to a plain object before handing it to this
   // serializer, and that mapping is where the request id lives. Inside a request
@@ -150,10 +227,10 @@ export function reqSerializer(req: any): SerializedRequest {
   if (typeof req.id === "string" && req.id) {
     serialized.id = req.id;
   }
-  if (req.remoteAddress) {
+  if (typeof req.remoteAddress === "string" && req.remoteAddress) {
     serialized.remoteAddress = req.remoteAddress;
   }
-  if (req.remotePort) {
+  if (typeof req.remotePort === "number") {
     serialized.remotePort = req.remotePort;
   }
 
@@ -270,9 +347,7 @@ function sanitizeForLog(
 
     const sanitized: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value)) {
-      sanitized[key] = SENSITIVE_KEYS.has(key.toLowerCase())
-        ? REDACTED
-        : sanitizeForLog(item, depth + 1, seen);
+      sanitized[key] = isSensitiveKey(key) ? REDACTED : sanitizeForLog(item, depth + 1, seen);
     }
     return sanitized;
   } finally {
@@ -379,3 +454,92 @@ export function errorSerializer(error: unknown): SerializedError {
 
   return { ...errorHeadline(error), ...applicationErrorFields(error) };
 }
+
+// ─── Stellar transaction hash serializer ────────────────────────────────────
+
+/**
+ * Number of hexadecimal characters in a Stellar transaction hash.
+ *
+ * A Stellar transaction hash is the SHA-256 digest of the transaction
+ * envelope, so it is always exactly 32 bytes rendered as 64 hex characters
+ * (e.g. Horizon's `hash` field and `Transaction.hash()` both produce this
+ * shape).
+ */
+export const STELLAR_TX_HASH_HEX_LENGTH = 64;
+
+/** Exact shape of a well-formed Stellar transaction hash. */
+const STELLAR_TX_HASH_PATTERN = /^[0-9a-fA-F]{64}$/;
+
+/** Leading characters kept when shortening a valid hash for logs. */
+const TX_HASH_HEAD = 8;
+
+/** Trailing characters kept when shortening a valid hash for logs. */
+const TX_HASH_TAIL = 8;
+
+/** Emitted for `null` / `undefined` hash fields. */
+export const MISSING_TX_HASH = "[missing-tx-hash]";
+
+/** Emitted for non-string or structurally-invalid hash fields. */
+export const INVALID_TX_HASH = "[invalid-tx-hash]";
+
+/**
+ * Type guard: is `value` a well-formed Stellar transaction hash?
+ *
+ * Surrounding whitespace is tolerated (anchors and clients sometimes pad
+ * values) and the hash is matched case-insensitively — Stellar emits
+ * lowercase, but uppercase hex is accepted and normalized downstream.
+ */
+export function isStellarTxHash(value: unknown): value is string {
+  return typeof value === "string" && STELLAR_TX_HASH_PATTERN.test(value.trim());
+}
+
+/**
+ * Shorten a validated transaction hash for human-readable log output:
+ * `abc12345…6789def0`. Short inputs are returned untouched so the helper
+ * cannot mangle a value it was never meant to transform.
+ */
+export function truncateStellarTxHash(hash: string): string {
+  const normalized = hash.trim();
+  if (normalized.length <= TX_HASH_HEAD + TX_HASH_TAIL) return normalized;
+  return `${normalized.slice(0, TX_HASH_HEAD)}…${normalized.slice(-TX_HASH_TAIL)}`;
+}
+
+/**
+ * Pino-compatible serializer for Stellar transaction hashes.
+ *
+ * Raw transaction objects and full 64-character hashes clutter structured log
+ * output. This serializer validates the value, normalizes it to lowercase, and
+ * shortens it to an `xxxxxxxx…xxxxxxxx` form. Malformed values never throw and
+ * are replaced with a sentinel so the field is still visible without echoing
+ * untrusted input into the logs.
+ *
+ * Non-string values (including `null`) are collapsed to a sentinel rather than
+ * stringified — a serialized object or `"undefined"` would be both noisy and
+ * misleading about which hash a log line refers to.
+ */
+export function txHashSerializer(value: unknown): string {
+  if (value === null || value === undefined) return MISSING_TX_HASH;
+  if (typeof value !== "string") return INVALID_TX_HASH;
+  if (!isStellarTxHash(value)) return INVALID_TX_HASH;
+  return truncateStellarTxHash(value.trim().toLowerCase());
+}
+
+/**
+ * Pino `serializers` entries for the field names Stellar hashes travel under
+ * across the API server and workers.
+ *
+ * Spread this into a Pino `serializers` map (or a Fastify `logger.serializers`
+ * config) so every Stellar hash field is normalized and shortened
+ * automatically. Pino only invokes a serializer for the exact key it is
+ * registered under, so each known alias is listed explicitly.
+ */
+export const stellarTxHashSerializers: Record<
+  string,
+  (value: unknown) => string
+> = {
+  txHash: txHashSerializer,
+  stellarTxHash: txHashSerializer,
+  intendedTxHash: txHashSerializer,
+  transactionHash: txHashSerializer,
+  stellarTransactionHash: txHashSerializer,
+};

@@ -105,11 +105,29 @@ afterAll(async () => {
 });
 
 describe("shared logger options", () => {
-  it("registers a serializer for requests, responses, and errors", () => {
-    expect(Object.keys(LOGGER_SERIALIZERS).sort()).toEqual(["err", "req", "res"]);
+  it("registers serializers for requests, responses, errors, and tx hashes", () => {
+    expect(Object.keys(LOGGER_SERIALIZERS).sort()).toEqual([
+      "err",
+      "intendedTxHash",
+      "req",
+      "res",
+      "stellarTransactionHash",
+      "stellarTxHash",
+      "transactionHash",
+      "txHash",
+    ]);
     for (const serializer of Object.values(LOGGER_SERIALIZERS)) {
       expect(typeof serializer).toBe("function");
     }
+  });
+
+  it("shortens Stellar transaction hashes through the shared serializer map", () => {
+    const hash =
+      "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
+    expect(LOGGER_SERIALIZERS.txHash(hash)).toBe("a1b2c3d4…ddeeff00");
+    expect(LOGGER_SERIALIZERS.stellarTxHash("not-a-hash")).toBe(
+      "[invalid-tx-hash]"
+    );
   });
 
   it("censors the authorization and cookie headers, and credential-shaped fields", () => {
@@ -234,6 +252,52 @@ describe("request logging through the Fastify instance", () => {
     expect(failure?.err.code).toBe("INTERNAL_ERROR");
     expect(failure?.err.statusCode).toBe(500);
     expect(failure?.err.stack).toContain("Widget registry unavailable");
+  });
+
+  it("redacts the rest of the authorization family on the way in", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/health/live",
+      headers: {
+        authorization: `Bearer ${BEARER_TOKEN}`,
+        "proxy-authorization": "Basic cHJveHk6c2VjcmV0",
+        "x-api-key": "api-key-secret-123",
+        "x-request-id": "req-auth-family-test",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const incoming = linesFor("req-auth-family-test").find(
+      (line) => line.msg === "incoming request"
+    );
+    expect(incoming).toBeDefined();
+    expect(incoming!.req.headers.authorization).toBe("[REDACTED]");
+    expect(incoming!.req.headers["proxy-authorization"]).toBe("[REDACTED]");
+    expect(incoming!.req.headers["x-api-key"]).toBe("[REDACTED]");
+
+    // Gone from the whole output, not just from the header fields.
+    const output = JSON.stringify(linesFor("req-auth-family-test"));
+    expect(output).not.toContain("cHJveHk6c2VjcmV0");
+    expect(output).not.toContain("api-key-secret-123");
+    expect(output).not.toContain(BEARER_TOKEN);
+  });
+
+  it("keeps a credential out of both the query field and the URL it rode in on", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/health/live?token=query-secret-value&probe=1",
+      headers: { "x-request-id": "req-query-secret-test" },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const requestLines = linesFor("req-query-secret-test");
+    const incoming = requestLines.find((line) => line.msg === "incoming request");
+    expect(incoming).toBeDefined();
+    expect(incoming!.req.query).toEqual({ token: "[REDACTED]", probe: "1" });
+    // Fastify's own "incoming request" line logs the raw URL, query string
+    // included — scrubbing `query` alone would leave the token one field over.
+    expect(String(incoming!.req.url)).toContain("token=[REDACTED]");
+    expect(JSON.stringify(requestLines)).not.toContain("query-secret-value");
   });
 });
 
