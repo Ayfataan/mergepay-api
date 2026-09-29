@@ -82,6 +82,17 @@ function pollResult(status: string, over: Record<string, unknown> = {}) {
   };
 }
 
+function errorPollResult(message: string, errorCategory: "permanent" | "transient" = "transient", over: Record<string, unknown> = {}) {
+  return {
+    rawStatus: null,
+    status: "pending_anchor",
+    message,
+    isError: true,
+    errorCategory,
+    ...over,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   h.getToml.mockResolvedValue({ transferServerSep24: "https://anchor.test/sep24" });
@@ -149,5 +160,112 @@ describe("reconcileAnchors", () => {
         data: expect.objectContaining({ status: "completed" }),
       })
     );
+  });
+
+  describe("retry logic and exponential backoff", () => {
+    it("retries transient failures with exponential backoff", async () => {
+      const session = fakeSession({ retryCount: 0 });
+      prisma.anchorSession.findMany.mockResolvedValue([session]);
+      prisma.anchorSession.findUnique.mockResolvedValue(session);
+      h.pollTransaction.mockResolvedValue(errorPollResult("connection timeout", "transient"));
+      prisma.anchorSession.update.mockResolvedValue(session);
+      prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
+
+      await reconcileAnchors();
+
+      expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "session_1" },
+          data: expect.objectContaining({
+            retryCount: 1,
+            errorCategory: "transient",
+            nextAttemptAt: expect.any(Date),
+          }),
+        })
+      );
+    });
+
+    it("marks permanent failures as error immediately without retrying", async () => {
+      const session = fakeSession({ retryCount: 0 });
+      prisma.anchorSession.findMany.mockResolvedValue([session]);
+      prisma.anchorSession.findUnique.mockResolvedValue(session);
+      h.pollTransaction.mockResolvedValue(errorPollResult("malformed response", "permanent"));
+      prisma.anchorSession.update.mockResolvedValue({ ...session, status: "error" });
+      prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
+
+      await reconcileAnchors();
+
+      expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "session_1", status: "pending_anchor" },
+          data: expect.objectContaining({
+            status: "error",
+            errorCategory: "permanent",
+            failureReason: "malformed response",
+          }),
+        })
+      );
+    });
+
+    it("marks exhausted retries as dead letter with permanent error", async () => {
+      const session = fakeSession({ retryCount: 3 }); // Assuming maxAttempts is 3
+      prisma.anchorSession.findMany.mockResolvedValue([session]);
+      prisma.anchorSession.findUnique.mockResolvedValue(session);
+      h.pollTransaction.mockResolvedValue(errorPollResult("connection timeout", "transient"));
+      prisma.anchorSession.update.mockResolvedValue({ ...session, status: "error" });
+      prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
+
+      await reconcileAnchors();
+
+      expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "session_1", status: "pending_anchor" },
+          data: expect.objectContaining({
+            status: "error",
+            errorCategory: "permanent",
+            failureReason: expect.stringContaining("retries exhausted"),
+            nextAttemptAt: null,
+            retryCount: 0,
+          }),
+        })
+      );
+    });
+
+    it("increments retry count for each transient failure", async () => {
+      const session = fakeSession({ retryCount: 1 });
+      prisma.anchorSession.findMany.mockResolvedValue([session]);
+      prisma.anchorSession.findUnique.mockResolvedValue(session);
+      h.pollTransaction.mockResolvedValue(errorPollResult("service unavailable", "transient"));
+      prisma.anchorSession.update.mockResolvedValue(session);
+      prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
+
+      await reconcileAnchors();
+
+      expect(prisma.anchorSession.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "session_1" },
+          data: expect.objectContaining({
+            retryCount: 2,
+          }),
+        })
+      );
+    });
+
+    it("schedules next attempt with delay based on retry policy", async () => {
+      const session = fakeSession({ retryCount: 0 });
+      prisma.anchorSession.findMany.mockResolvedValue([session]);
+      prisma.anchorSession.findUnique.mockResolvedValue(session);
+      h.pollTransaction.mockResolvedValue(errorPollResult("timeout", "transient"));
+      prisma.anchorSession.update.mockResolvedValue(session);
+      prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
+
+      await reconcileAnchors();
+
+      const updateCall = prisma.anchorSession.update.mock.calls[0];
+      const nextAttemptAt = updateCall[0].data.nextAttemptAt;
+      
+      expect(nextAttemptAt).toBeInstanceOf(Date);
+      expect(nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
+    });
   });
 });
