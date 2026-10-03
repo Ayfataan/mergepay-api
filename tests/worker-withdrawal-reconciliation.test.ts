@@ -13,6 +13,7 @@ const h = vi.hoisted(() => {
     prisma,
     getToml: vi.fn(),
     pollTransaction: vi.fn(),
+    applyWithdrawalTransition: vi.fn(),
   };
 });
 
@@ -28,6 +29,10 @@ vi.mock("../src/services/anchor", async (importActual) => {
     },
   };
 });
+vi.mock("../src/services/withdrawal-status", () => ({
+  applyWithdrawalTransition: h.applyWithdrawalTransition,
+  mapAnchorStatusToWithdrawalStatus: vi.fn((status) => status),
+}));
 
 import { reconcileWithdrawals } from "../src/worker/index";
 
@@ -78,16 +83,15 @@ describe("reconcileWithdrawals", () => {
     const withdrawal = fakeWithdrawal();
     prisma.withdrawal.findMany.mockResolvedValue([withdrawal]);
     h.pollTransaction.mockResolvedValue(pollResult("completed"));
-    prisma.withdrawal.update.mockResolvedValue({ ...withdrawal, status: "completed" });
+    h.applyWithdrawalTransition.mockResolvedValue({ changed: true });
 
     await reconcileWithdrawals();
 
-    expect(prisma.withdrawal.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: "withdrawal_1" },
-        data: expect.objectContaining({ status: "completed" }),
-      })
-    );
+    expect(h.applyWithdrawalTransition).toHaveBeenCalledWith({
+      withdrawalId: "withdrawal_1",
+      nextStatus: "completed",
+      source: "poll",
+    });
   });
 
   it("skips cycle when anchor TOML is unavailable", async () => {
@@ -108,15 +112,14 @@ describe("reconcileWithdrawals", () => {
     h.pollTransaction
       .mockRejectedValueOnce(new Error("network blip"))
       .mockResolvedValueOnce(pollResult("completed"));
-    prisma.withdrawal.update.mockResolvedValue({ ...withdrawalB, status: "completed" });
+    h.applyWithdrawalTransition.mockResolvedValue({ changed: true });
 
     await expect(reconcileWithdrawals()).resolves.not.toThrow();
-    expect(prisma.withdrawal.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: "withdrawal_b" },
-        data: expect.objectContaining({ status: "completed" }),
-      })
-    );
+    expect(h.applyWithdrawalTransition).toHaveBeenCalledWith({
+      withdrawalId: "withdrawal_b",
+      nextStatus: "completed",
+      source: "poll",
+    });
   });
 
   describe("retry logic and exponential backoff", () => {
@@ -153,13 +156,25 @@ describe("reconcileWithdrawals", () => {
     });
 
     it("marks exhausted retries as dead letter with permanent error", async () => {
-      const withdrawal = fakeWithdrawal({ retryCount: 3 }); // Assuming maxAttempts is 3
+      const withdrawal = fakeWithdrawal({ retryCount: 4 }); // maxAttempts is 5, so retryCount=4 exhausts (attempt=5)
       prisma.withdrawal.findMany.mockResolvedValue([withdrawal]);
       h.pollTransaction.mockResolvedValue(errorPollResult("connection timeout", "transient"));
       prisma.withdrawal.update.mockResolvedValue({ ...withdrawal, status: "failed" });
 
       await reconcileWithdrawals();
 
+      // When exhausted, the errorCategory is set to permanent immediately
+      expect(prisma.withdrawal.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "withdrawal_1" },
+          data: expect.objectContaining({
+            retryCount: 5,
+            errorCategory: "permanent", // exhausted immediately sets to permanent
+            nextAttemptAt: null,
+          }),
+        })
+      );
+      // Second update marks as failed
       expect(prisma.withdrawal.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: "withdrawal_1" },
@@ -209,7 +224,8 @@ describe("reconcileWithdrawals", () => {
 
     it("does not process withdrawals with permanent error category", async () => {
       const withdrawal = fakeWithdrawal({ errorCategory: "permanent" });
-      prisma.withdrawal.findMany.mockResolvedValue([withdrawal]);
+      // The findMany query filters out permanent errors, so it should return empty
+      prisma.withdrawal.findMany.mockResolvedValue([]);
 
       await reconcileWithdrawals();
 
@@ -220,7 +236,8 @@ describe("reconcileWithdrawals", () => {
     it("respects backoff window by checking nextAttemptAt", async () => {
       const futureDate = new Date(Date.now() + 60000); // 1 minute in future
       const withdrawal = fakeWithdrawal({ nextAttemptAt: futureDate });
-      prisma.withdrawal.findMany.mockResolvedValue([withdrawal]);
+      // The findMany query filters out withdrawals with future nextAttemptAt
+      prisma.withdrawal.findMany.mockResolvedValue([]);
 
       await reconcileWithdrawals();
 

@@ -23,6 +23,7 @@ const h = vi.hoisted(() => {
     audit: vi.fn(),
     getToml: vi.fn(),
     pollTransaction: vi.fn(),
+    applyAnchorSessionTransition: vi.fn().mockResolvedValue({ changed: true }),
   };
 });
 
@@ -53,6 +54,10 @@ vi.mock("../src/services/anchor", async (importActual) => {
     },
   };
 });
+vi.mock("../src/services/anchor-status", () => ({
+  applyAnchorSessionTransition: h.applyAnchorSessionTransition,
+  isTerminalAnchorStatus: vi.fn((status: string) => status === "error" || status === "completed" || status === "refunded"),
+}));
 
 import { reconcileAnchors } from "../src/worker/index";
 
@@ -68,6 +73,11 @@ function fakeSession(over: Record<string, any> = {}) {
     retryCount: 0,
     failureReason: null,
     lastPolledAt: null,
+    errorCategory: null,
+    nextAttemptAt: null,
+    claimedAt: null,
+    claimedBy: null,
+    leaseExpiresAt: null,
     ...over,
   };
 }
@@ -109,14 +119,22 @@ describe("reconcileAnchors", () => {
 
     await reconcileAnchors();
 
-    // Status advancement is now a conditional updateMany guarded on the status
-    // the worker observed, so stale pollers can never regress a terminal state.
-    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: "session_1", status: "pending_anchor" },
-        data: expect.objectContaining({ status: "completed" }),
-      })
-    );
+    // Status advancement now uses applyAnchorSessionTransition
+    expect(h.applyAnchorSessionTransition).toHaveBeenCalledWith({
+      sessionId: "session_1",
+      nextStatus: "completed",
+      source: "poll",
+      expectedCurrentStatus: "pending_anchor",
+      rawStatus: "completed",
+      reason: undefined,
+      extraData: expect.objectContaining({
+        lastPolledAt: expect.any(Date),
+        failureReason: null,
+        errorCategory: null,
+        nextAttemptAt: null,
+        retryCount: 0,
+      }),
+    });
     expect(h.audit).toHaveBeenCalledWith(
       expect.objectContaining({
         action: "anchor.session.completed",
@@ -154,12 +172,21 @@ describe("reconcileAnchors", () => {
     prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
 
     await expect(reconcileAnchors()).resolves.not.toThrow();
-    expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: "session_b", status: "pending_anchor" },
-        data: expect.objectContaining({ status: "completed" }),
-      })
-    );
+    expect(h.applyAnchorSessionTransition).toHaveBeenCalledWith({
+      sessionId: "session_b",
+      nextStatus: "completed",
+      source: "poll",
+      expectedCurrentStatus: "pending_anchor",
+      rawStatus: "completed",
+      reason: undefined,
+      extraData: expect.objectContaining({
+        lastPolledAt: expect.any(Date),
+        failureReason: null,
+        errorCategory: null,
+        nextAttemptAt: null,
+        retryCount: 0,
+      }),
+    });
   });
 
   describe("retry logic and exponential backoff", () => {
@@ -195,40 +222,49 @@ describe("reconcileAnchors", () => {
 
       await reconcileAnchors();
 
-      expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: "session_1", status: "pending_anchor" },
-          data: expect.objectContaining({
-            status: "error",
-            errorCategory: "permanent",
-            failureReason: "malformed response",
-          }),
-        })
-      );
+      // Permanent failures now use applyAnchorSessionTransition
+      expect(h.applyAnchorSessionTransition).toHaveBeenCalledWith({
+        sessionId: "session_1",
+        nextStatus: "error",
+        source: "poll",
+        expectedCurrentStatus: "pending_anchor",
+        reason: "malformed response",
+        extraData: expect.objectContaining({
+          lastPolledAt: expect.any(Date),
+          failureReason: "malformed response",
+          errorCategory: "permanent",
+          nextAttemptAt: null,
+          retryCount: 0,
+        }),
+      });
     });
 
     it("marks exhausted retries as dead letter with permanent error", async () => {
-      const session = fakeSession({ retryCount: 3 }); // Assuming maxAttempts is 3
+      const session = fakeSession({ retryCount: 4 }); // maxAttempts is 5, so retryCount=4 exhausts (attempt=5)
       prisma.anchorSession.findMany.mockResolvedValue([session]);
       prisma.anchorSession.findUnique.mockResolvedValue(session);
       h.pollTransaction.mockResolvedValue(errorPollResult("connection timeout", "transient"));
       prisma.anchorSession.update.mockResolvedValue({ ...session, status: "error" });
       prisma.anchorSession.updateMany.mockResolvedValue({ count: 1 });
+      h.applyAnchorSessionTransition.mockResolvedValue({ changed: true });
 
       await reconcileAnchors();
 
-      expect(prisma.anchorSession.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: "session_1", status: "pending_anchor" },
-          data: expect.objectContaining({
-            status: "error",
-            errorCategory: "permanent",
-            failureReason: expect.stringContaining("retries exhausted"),
-            nextAttemptAt: null,
-            retryCount: 0,
-          }),
-        })
-      );
+      // The implementation now uses applyAnchorSessionTransition for permanent failures
+      expect(h.applyAnchorSessionTransition).toHaveBeenCalledWith({
+        sessionId: "session_1",
+        nextStatus: "error",
+        source: "poll",
+        expectedCurrentStatus: "pending_anchor",
+        reason: "connection timeout (retries exhausted after 5 attempts)",
+        extraData: expect.objectContaining({
+          lastPolledAt: expect.any(Date),
+          failureReason: "connection timeout (retries exhausted after 5 attempts)",
+          errorCategory: "permanent",
+          nextAttemptAt: null,
+          retryCount: 0,
+        }),
+      });
     });
 
     it("increments retry count for each transient failure", async () => {
