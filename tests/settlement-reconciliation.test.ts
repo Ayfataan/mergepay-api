@@ -52,6 +52,7 @@ vi.mock("../src/services/horizonService", () => ({
   verifyPaymentOperation: h.verifyPaymentOperation,
 }));
 
+import { config } from "../src/config";
 import {
   reconcileSingleSettlement,
   type ReconcilableSettlement,
